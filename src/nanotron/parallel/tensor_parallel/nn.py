@@ -109,6 +109,48 @@ class TensorParallelColumnLinear(nn.Linear):
         return f"tp_rank={dist.get_rank(self.pg)}, {super().extra_repr()}, unsharded_out_features={self.out_features * self.world_size}"
 
 
+class ScaledTensorParallelColumnLinear(TensorParallelColumnLinear):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        pg: dist.ProcessGroup,
+        mode: TensorParallelLinearMode,
+        scale_factor: int,
+        bias=True,
+        device=None,
+        dtype=None,
+        async_communication: bool = False,
+        contiguous_chunks: Optional[Tuple[int, ...]] = None,
+        tp_recompute_allgather: bool = True,
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            pg,
+            mode,
+            bias,
+            device,
+            dtype,
+            async_communication,
+            contiguous_chunks,
+            tp_recompute_allgather,
+        )
+
+        self.scale_factor = scale_factor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return column_linear(
+            input=x,
+            weight=self.weight / self.scale_factor,
+            bias=None if self.bias is None else self.bias / self.scale_factor,
+            group=self.pg,
+            tp_mode=self.mode,
+            async_communication=self.async_communication,
+            tp_recompute_allgather=self.tp_recompute_allgather,
+        )
+
+
 class TensorParallelRowLinear(nn.Linear):
     def __init__(
         self,

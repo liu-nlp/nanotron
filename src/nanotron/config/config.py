@@ -14,7 +14,14 @@ from transformers import AutoTokenizer
 from yaml.loader import SafeLoader
 
 from nanotron.config.lighteval_config import LightEvalConfig
-from nanotron.config.models_config import ExistingCheckpointInit, NanotronConfigs, RandomInit, SpectralMupInit
+from nanotron.config.models_config import (
+    ExistingCheckpointInit,
+    HyperCloningInit,
+    LlamaConfig,
+    NanotronConfigs,
+    RandomInit,
+    SpectralMupInit,
+)
 from nanotron.config.parallelism_config import ParallelismArgs
 from nanotron.config.utils_config import (
     InitScalingMethod,
@@ -143,6 +150,13 @@ class S3UploadArgs:
 
 
 @dataclass
+class HFUploadArgs:
+    """Arguments related to uploading checkpoints to HuggingFace"""
+
+    repo_id: str
+
+
+@dataclass
 class NanosetDatasetsArgs:
     dataset_folder: Union[str, List[str]]
     dataset_weights: Optional[List[float]] = None
@@ -163,6 +177,8 @@ class NanosetDatasetsArgs:
     dataset_max_tokens: Optional[List[int]] = None
     shuffle_files: Optional[bool] = False
     use_old_brrr_dataloader: Optional[bool] = False
+    drop_last: Optional[bool] = True
+    dataset_num_samples: Optional[List[int]] = None
 
     def __post_init__(self):
         if isinstance(self.dataset_folder, str):  # Case 1: 1 Dataset folder
@@ -185,6 +201,9 @@ class NanosetDatasetsArgs:
                     first_line = f.readline().strip()
                     if "|" in first_line:
                         tokenizer_name, token_size_in_bytes = first_line.split("|")
+                        tokenizer_name = (
+                            os.path.dirname(tokenizer_name) if tokenizer_name.endswith(".json") else tokenizer_name
+                        )
                         if self.tokenizer_name is None:
                             self.tokenizer_name = tokenizer_name
                             self.token_size_in_bytes = int(token_size_in_bytes)
@@ -248,6 +267,7 @@ class CheckpointsArgs:
     load_lr_scheduler: Optional[bool] = True
     load_optimizer: Optional[bool] = True
     checkpoints_path_is_shared_file_system: Optional[bool] = False
+    resume_metadata: Optional[bool] = True
 
     def __post_init__(self):
         if isinstance(self.checkpoints_path, str):
@@ -306,7 +326,7 @@ class ModelArgs:
     """Arguments related to model architecture"""
 
     model_config: NanotronConfigs
-    init_method: Union[RandomInit, SpectralMupInit, ExistingCheckpointInit]
+    init_method: Union[RandomInit, SpectralMupInit, ExistingCheckpointInit, HyperCloningInit]
     dtype: Optional[torch.dtype] = None
     make_vocab_size_divisible_by: int = 1
     ddp_bucket_cap_mb: int = 25
@@ -318,6 +338,11 @@ class ModelArgs:
             self.dtype = cast_str_to_torch_dtype(self.dtype)
 
         self.model_config._is_using_mup = isinstance(self.init_method, SpectralMupInit)
+
+        # Validate hyper cloning configuration
+        if isinstance(self.init_method, HyperCloningInit):
+            if not isinstance(self.model_config, LlamaConfig):
+                raise ValueError("HyperCloning initialization is currently only supported for the Llama architecture")
 
         # if self.model_config.max_position_embeddings is None:
         #     self.model_config.max_position_embeddings = 0
@@ -451,6 +476,7 @@ class Config:
     profiler: Optional[ProfilerArgs] = None
     lighteval: Optional[LightEvalConfig] = None
     s3_upload: Optional[S3UploadArgs] = None
+    hf_upload: Optional[HFUploadArgs] = None
 
     @classmethod
     def create_empty(cls):

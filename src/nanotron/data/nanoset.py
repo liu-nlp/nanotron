@@ -53,7 +53,7 @@ class Nanoset(torch.utils.data.Dataset):
         self.eos_token_id = eos_token_id
         self.return_positions = return_positions
         assert (
-            self.return_positions or self.eos_token_id is not None
+            not self.return_positions or self.eos_token_id is not None
         ), "If return_positions is True, eos_token_id must be defined"
         # Number of bytes for the tokens stored in the processed dataset files. 2 for vocab sizes < 65535, 4 otherwise
         self.token_size = token_size
@@ -66,13 +66,13 @@ class Nanoset(torch.utils.data.Dataset):
             self.datatrove_datasets.append(
                 DatatroveFolderDataset(
                     folder_path=dataset_folder,
-                    filename_pattern=os.path.join(dataset_folder, "*.ds"),
+                    filename_pattern="*.ds",
                     seq_len=sequence_length,
                     recursive=False,
                     token_size=self.token_size,
                     shuffle=True,
                     return_positions=self.return_positions,  # if set to True, the position ids are directly build datatrove
-                    eos_token_id=self.eos_token_id,
+                    positions_from_eos_token_id=self.eos_token_id,
                 )
             )
 

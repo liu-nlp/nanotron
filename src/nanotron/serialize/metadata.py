@@ -7,6 +7,7 @@ from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Type, U
 import dacite
 import torch
 from dacite import from_dict
+from datatrove.io import DataFolder
 from packaging.version import Version
 
 from nanotron import distributed as dist
@@ -138,6 +139,18 @@ def save_meta(parallel_context: ParallelContext, root_folder: Path, training_met
         return
 
     root_folder.mkdir(exist_ok=True, parents=True)
+
+    # Preprocess DataFolder keys in data_stages
+    if training_metadata.data_stages:
+        for stage in training_metadata.data_stages:
+            new_dict = {}
+            for k, v in stage.consumed_tokens_per_dataset_folder.items():
+                if isinstance(k, DataFolder):
+                    new_dict[str(k.path)] = v
+                else:
+                    new_dict[k] = v
+            stage.consumed_tokens_per_dataset_folder = new_dict
+
     checkpoint_metadata = CheckpointMetadata(
         version=CHECKPOINT_VERSION,
         tp=parallel_context.tp_pg.size(),

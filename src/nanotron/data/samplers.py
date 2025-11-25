@@ -226,10 +226,11 @@ class MegatronPretrainingSampler(BaseMegatronSampler):
         # Check the last partial batch and see drop_last is set
         if len(batch) > 0 and not self.drop_last:
             if self.pad_samples_to_global_batch_size:
+                log_rank("Padding final batch to global batch size", logger=logger, level=logging.INFO, rank=0)
                 for i in range(
                     self.data_parallel_rank, self.global_batch_size, self.micro_batch_times_data_parallel_size
                 ):
-                    indices = [batch[j] for j in range(i, max(len(batch), i + self.micro_batch_size))]
+                    indices = [batch[j] for j in range(i, min(len(batch), i + self.micro_batch_size))]
                     num_pad = self.micro_batch_size - len(indices)
                     indices = indices + [-1] * num_pad
                     yield indices

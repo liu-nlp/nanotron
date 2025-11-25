@@ -422,14 +422,10 @@ class TokenizedBytesFolderDataset(DatatroveFolderDataset):
             filename_pattern=filename_pattern,
             recursive=recursive,
             token_size=token_size,
-            max_tokens=max_tokens,
             shuffle=shuffle,
             seed=seed,
             return_positions=return_positions,
-            eos_token_id=eos_token_id,
-            read_path=folder_read_path,
-            matched_files=matched_files,
-            file_sizes=file_sizes,
+            positions_from_eos_token_id=eos_token_id,
         )
 
         self.subset_log = TBFolderDatasetLog(
@@ -538,9 +534,15 @@ def get_tb_datasets(
     """
     log_rank("Building Streamable datasets.", logger=logger, level=logging.INFO, rank=0)
     dataset_max_tokens = config.dataset_max_tokens
+    train_num_samples = None
     if dataset_max_tokens is None:
         dataset_max_tokens = [None] * len(config.dataset_folder)
-    train_num_samples = train_steps * global_batch_size
+        if config.dataset_num_samples:
+            train_num_samples = sum(config.dataset_num_samples)
+    elif config.dataset_num_samples:
+        raise ValueError("Either dataset_max_tokens or dataset_num_samples needs to be specified, not both")
+    if train_num_samples is None:
+        train_num_samples = train_steps * global_batch_size
 
     datasets = [
         build_dataset(
@@ -552,13 +554,14 @@ def get_tb_datasets(
             use_old_brrr_dataloader=config.use_old_brrr_dataloader,
             skip_in_stream=config.skip_in_stream,
             max_tokens=max_tokens,
-            num_samples=train_num_samples,
             shuffle=shuffle,
             seed=seed,
             folder_read_path=config.dataset_read_path[i] if config.dataset_read_path else None,
         )
         for i, (dataset_folder, max_tokens) in enumerate(zip(config.dataset_folder, dataset_max_tokens))
     ]
+
+    log_rank(f"Dataset Lengths: {[len(dataset) for dataset in datasets]}", logger=logger, level=logging.INFO, rank=0)
 
     if len(datasets) == 1 and False:
         outputs_dataset = datasets[0]
@@ -583,6 +586,7 @@ def get_tb_datasets(
             seed=seed,
             consumed_tokens_per_dataset_folder=consumed_tokens_per_dataset_folder,
         )
+        log_rank(f"Blended Dataset log: {outputs_dataset.subset_log}", logger=logger, level=logging.INFO, rank=0)
 
     log_rank("Streamable datasets ready.", logger=logger, level=logging.INFO, rank=0)
     train_data_log = TrainDataLog(

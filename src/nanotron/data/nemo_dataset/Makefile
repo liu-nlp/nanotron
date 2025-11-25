@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+PYTHON_CONFIG := $(shell which python3-config 2>/dev/null || which python3.10-config)
 
 CXXFLAGS += -O3 -Wall -shared -std=c++11 -fPIC -fdiagnostics-color
 CPPFLAGS += $(shell python3 -m pybind11 --includes)
 LIBNAME = helpers
-LIBEXT = $(shell python3-config --extension-suffix)
+LIBEXT = $(shell $(PYTHON_CONFIG) --extension-suffix)
 
 default: $(LIBNAME)$(LIBEXT)
 

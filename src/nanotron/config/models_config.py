@@ -33,6 +33,15 @@ class ExistingCheckpointInit:
 
 
 @dataclass
+class HyperCloningInit:
+    """This is used to initialize a model by hyper-cloning weights from an already existing model of half the size (without optimizer, lr_scheduler...)"""
+
+    path: Path
+    up_projection_cloning_factor: int = 2
+    embedding_dimension_cloning_factor: int = 2
+
+
+@dataclass
 class MoEConfig:
     """Configuration for Mixture of Experts layers"""
 
@@ -88,6 +97,7 @@ class LlamaConfig:
     _attn_implementation: Optional[AttentionImplementation] = DEFAULT_ATTENTION_IMPLEMENTATION
     z_loss_enabled: bool = False  # Z-loss regularization https://www.jmlr.org/papers/volume24/22-1144/22-1144.pdf
     z_loss_coefficient: float = 0.0001  # Default from the paper (10^-4)
+    lm_head_normalization_factor: int = 1  # Scales down the weights in the LM head when initializing the model with hyper-cloning and using tied embedding matrices
 
     def __post_init__(self):
         # NOTE: user don't set self._init_method, ModelArgs will set it

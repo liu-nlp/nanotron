@@ -28,7 +28,7 @@ from nanotron.generation.decode import (
     decode_tokenized,
 )
 from nanotron.logging import log_rank, set_ranks_logging_level
-from nanotron.models import build_model
+from nanotron.models import CONFIG_TO_TRAINING_MODEL_CLASS, build_model
 from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import sanity_check
 from nanotron.parallel.pipeline_parallel.engine import (
@@ -43,7 +43,7 @@ from nanotron.random import (
     set_random_seed,
 )
 from nanotron.serialize import load_weights
-from nanotron.trainer import CONFIG_TO_MODEL_CLASS, mark_tied_parameters
+from nanotron.trainer import mark_tied_parameters
 
 try:
     from transformers import AutoTokenizer
@@ -111,9 +111,9 @@ def main():
     set_random_seed(42)
 
     model_config_cls = model_config.__class__.__name__
-    if model_config_cls not in CONFIG_TO_MODEL_CLASS:
+    if model_config_cls not in CONFIG_TO_TRAINING_MODEL_CLASS:
         raise ValueError(
-            f"Unsupported model config {model_config_cls}. Only {CONFIG_TO_MODEL_CLASS.keys()} are supported"
+            f"Unsupported model config {model_config_cls}. Only {CONFIG_TO_TRAINING_MODEL_CLASS.keys()} are supported"
         )
 
     # Get synchronized random states
@@ -126,7 +126,7 @@ def main():
         random_states = RandomStates({})
 
     model = build_model(
-        model_builder=lambda: CONFIG_TO_MODEL_CLASS[model_config_cls](
+        model_builder=lambda: CONFIG_TO_TRAINING_MODEL_CLASS[model_config_cls](
             config=model_config,
             parallel_context=parallel_context,
             parallel_config=parallel_config,

@@ -27,7 +27,7 @@ from torch.utils.checkpoint import CheckpointFunction
 from nanotron import distributed as dist
 from nanotron import logging
 from nanotron.config import Config, LlamaConfig, ParallelismArgs
-from nanotron.config.models_config import RandomInit, SpectralMupInit
+from nanotron.config.models_config import HyperCloningInit, RandomInit, SpectralMupInit
 from nanotron.generation.generate_store import AttachableStore
 from nanotron.logging import log_rank
 from nanotron.models import NanotronModel
@@ -39,13 +39,18 @@ from nanotron.parallel.pipeline_parallel.block import PipelineBlock, TensorPoint
 from nanotron.parallel.pipeline_parallel.p2p import P2P
 from nanotron.parallel.tensor_parallel.functional import sharded_cross_entropy
 from nanotron.parallel.tensor_parallel.nn import (
+    ScaledTensorParallelColumnLinear,
     TensorParallelColumnLinear,
     TensorParallelEmbedding,
     TensorParallelLinearMode,
     TensorParallelRowLinear,
 )
 from nanotron.random import RandomStates
-from nanotron.scaling.parametrization import SpectralMupParametrizator, StandardParametrizator
+from nanotron.scaling.parametrization import (
+    HyperCloningParametrizator,
+    SpectralMupParametrizator,
+    StandardParametrizator,
+)
 from nanotron.utils import checkpoint_method
 
 logger = logging.get_logger(__name__)
@@ -544,14 +549,14 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 )
                 # Remove pad tokens from key_states and concatenate samples in key_unpad
                 # cu_seqlens_k is the cumulative sequence lengths of key_states
-                (query_unpad, indices_q, cu_seqlens_q, max_seqlen_q) = bert_padding.unpad_input(
+                (query_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *_) = bert_padding.unpad_input(
                     query_states,
                     sequence_mask,
                 )
-                (key_unpad, indices_k, cu_seqlens_k, max_seqlen_k) = bert_padding.unpad_input(
+                (key_unpad, indices_k, cu_seqlens_k, max_seqlen_k, *_) = bert_padding.unpad_input(
                     key_states, sequence_mask
                 )
-                (value_unpad, _, _, _) = bert_padding.unpad_input(value_states, sequence_mask)
+                (value_unpad, *_) = bert_padding.unpad_input(value_states, sequence_mask)
 
                 # NOTE: this scale is for µTransfer,
                 # in SP, we use sqrt(1/d_h)
@@ -878,10 +883,16 @@ class LlamaModel(nn.Module):
             module_output_keys={"hidden_states"},
         )  # TODO
 
+        scale_args = (
+            {"scale_factor": config.lm_head_normalization_factor} if config.lm_head_normalization_factor > 1 else {}
+        )
+
         self.lm_head = PipelineBlock(
             p2p=self.p2p,
             # Understand that this means that we return sharded logits that are going to need to be gathered
-            module_builder=TensorParallelColumnLinear,
+            module_builder=ScaledTensorParallelColumnLinear
+            if config.lm_head_normalization_factor > 1
+            else TensorParallelColumnLinear,
             module_kwargs={
                 "in_features": config.hidden_size,
                 "out_features": config.vocab_size,
@@ -891,6 +902,7 @@ class LlamaModel(nn.Module):
                 "mode": self.tp_mode,
                 "async_communication": tp_linear_async_communication,
                 "tp_recompute_allgather": parallel_config.tp_recompute_allgather,
+                **scale_args,
             },
             module_input_keys={"x"},
             module_output_keys={"logits"},
@@ -1089,10 +1101,16 @@ class LlamaForTraining(NanotronModel):
             parametrizator_cls = StandardParametrizator
         elif isinstance(init_method, SpectralMupInit):
             parametrizator_cls = SpectralMupParametrizator
+        elif isinstance(init_method, HyperCloningInit):
+            parametrizator_cls = HyperCloningParametrizator
         else:
             raise ValueError(f"Unknown init method {init_method}")
 
-        parametrizator = parametrizator_cls(config=config.model)
+        parametrizator = parametrizator_cls(config=config)  # replaced config.model with config
+
+        # Load weights of the existing smaller model for hyper cloning
+        if isinstance(parametrizator, HyperCloningParametrizator):
+            parametrizator.load_original_weights()
 
         log_rank(
             f"Parametrizing model parameters using {parametrizator.__class__.__name__}",
@@ -1126,7 +1144,7 @@ class LlamaForTraining(NanotronModel):
                 continue
 
             module = model.get_submodule(module_name)
-            parametrizator.parametrize(param_name, module)
+            parametrizator.parametrize(param_name, module, full_param_name)
 
             assert full_param_name not in initialized_parameters
             initialized_parameters.add(full_param_name)
@@ -1137,6 +1155,10 @@ class LlamaForTraining(NanotronModel):
             else name
             for name, param in model.named_parameters()
         }, f"Somehow the initialized set of parameters don't match:\n - Expected: { {name for name, _ in model.named_parameters()} }\n - Got: {initialized_parameters}"
+
+        # Explicitly clear base model weights to free up memory
+        if isinstance(parametrizator, HyperCloningParametrizator):
+            parametrizator.deallocate_base_weights()
 
     def get_embeddings_lm_head_tied_names(self):
         """Get the names of the tied embeddings and lm_head weights"""

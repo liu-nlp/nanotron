@@ -6,6 +6,8 @@ import shutil
 import tempfile
 import time
 from dataclasses import asdict
+from logging import Logger
+from multiprocessing import Process
 from pathlib import Path
 from pprint import pformat
 from typing import (
@@ -23,6 +25,7 @@ from typing import (
 
 import psutil
 import torch
+from huggingface_hub import HfApi
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
@@ -37,6 +40,8 @@ from nanotron.config import (
     SpectralMupInit,
     get_config_from_file,
 )
+from nanotron.config.config import HFUploadArgs
+from nanotron.config.models_config import HyperCloningInit
 from nanotron.constants import MODEL_CONFIG_FILE_NAME
 from nanotron.data.dataloader import sanity_check_dataloader
 from nanotron.eval import LightEvalRunner
@@ -61,11 +66,9 @@ from nanotron.logging import (
 )
 from nanotron.logging.timers import nanotron_timer
 from nanotron.metrics_logging import MetricsLogger
-from nanotron.models import NanotronModel, build_model
+from nanotron.models import CONFIG_TO_TRAINING_MODEL_CLASS, NanotronModel, build_model
 from nanotron.models.base import check_model_has_grad
-from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
-from nanotron.models.qwen import Qwen2ForTraining
-from nanotron.models.starcoder2 import Starcoder2ForTraining
+from nanotron.models.llama import RotaryEmbedding
 from nanotron.optim.clip_grads import clip_grad_norm
 from nanotron.parallel import ParallelContext
 from nanotron.parallel.data_parallel.utils import sync_gradients_across_dp
@@ -109,16 +112,35 @@ logger = logging.get_logger(__name__)
 dist_logger = logging.get_logger(dist.dist.__name__)
 dist_logger.setLevel(logging.WARNING)
 
-CONFIG_TO_MODEL_CLASS = {
-    "LlamaConfig": LlamaForTraining,
-    "Starcoder2Config": Starcoder2ForTraining,
-    "Qwen2Config": Qwen2ForTraining,
-}
-
 try:
     import wandb
 except ImportError:
     wandb = None
+
+
+def push_checkpoint_to_hub(
+    huggingface_config: HFUploadArgs, checkpoints_path: str, iteration_step: int, logger: Logger
+):
+    api = HfApi()
+    repo_id = huggingface_config.repo_id
+    try:
+        api.create_repo(repo_id, private=True)
+    except Exception as e:
+        log_rank(
+            f"Repository {repo_id} already exists or could not be created: {e}",
+            logger=logger,
+            level=logging.INFO,
+            rank=0,
+        )
+
+    api.upload_folder(
+        folder_path=checkpoints_path,
+        path_in_repo=f"checkpoints/checkpoint_{iteration_step}",
+        repo_id=repo_id,
+        repo_type="model",
+    )
+
+    log_rank(f"Uploaded checkpoint to Hugging Face Hub at {repo_id}", logger=logger, level=logging.INFO, rank=0)
 
 
 def get_size(bytes):
@@ -161,7 +183,14 @@ class DistributedTrainer:
 
         self.model_config = self.config.model.model_config
         if model_class is not None:
-            CONFIG_TO_MODEL_CLASS[self.model_config.__class__.__name__] = model_class
+            CONFIG_TO_TRAINING_MODEL_CLASS[self.model_config.__class__.__name__] = model_class
+
+        # Fail early if HuggingFace Hub upload is specified but no API token was provided
+        if self.config.hf_upload is not None and "HF_TOKEN" not in os.environ:
+            raise KeyError("HF_TOKEN not specified but required for pushing to the hub")
+
+        # Track current upload process if HuggingFace Hub upload is enabled
+        self.hf_upload_process = None
 
         ########################################
         ## We start with setting up loggers and process groups
@@ -238,7 +267,7 @@ class DistributedTrainer:
             )
 
         # Define iteration start state
-        if self.init_checkpoint_path is not None and self.config.checkpoints.load_lr_scheduler:
+        if self.init_checkpoint_path is not None and self.config.checkpoints.resume_metadata:
             checkpoint_metadata = load_meta(
                 parallel_context=self.parallel_context, root_folder=self.init_checkpoint_path
             )
@@ -571,7 +600,9 @@ class DistributedTrainer:
                 outputs, loss_avg, z_loss_avg = self.training_step(dataloader=self.current_dataloader)
 
                 # Update consumption tracking for current batch
-                if hasattr(self.current_base_dl, "dataset"):
+                if hasattr(self.current_base_dl, "dataset") and hasattr(
+                    self.current_base_dl.dataset, "update_consumption_metrics"
+                ):
                     self.current_base_dl.dataset.update_consumption_metrics(
                         start_idx=(self.iteration_step - 1)
                         * self.global_batch_size,  # assumes we start from iteration_step=1
@@ -581,7 +612,9 @@ class DistributedTrainer:
 
                 # Training Logs
                 # Track consumed tokens for all dataset folders in current stage
-                if hasattr(self.current_base_dl, "dataset"):
+                if hasattr(self.current_base_dl, "dataset") and hasattr(
+                    self.current_base_dl.dataset, "get_consumption_stats"
+                ):
                     consumption_stats = self.current_base_dl.dataset.get_consumption_stats()
                     current_stage = self.metadata.data_stages[self.metadata.last_stage_idx]
 
@@ -785,7 +818,7 @@ class DistributedTrainer:
                 "tokens_per_sec_per_gpu", tokens_per_sec / self.parallel_context.world_pg.size(), "human_format"
             ),  # , "1.6E"),
             LogItem("global_batch_size", self.config.global_batch_size_in_tokens, "human_format"),  # , "5d"),
-            LogItem("lm_loss", loss_avg.item(), "human_format"),  # , "1.6E"),
+            LogItem("lm_loss", float("NaN") if loss_avg is None else loss_avg.item(), "human_format"),  # , "1.6E"),
             LogItem("lr", lr, "human_format"),  # , ".3E"),
             LogItem("model_tflops_per_gpu", model_tflops, "human_format"),  # , ".2f"),
             # LogItem("hardware_tflops_per_gpu", hardware_tflops, "human_format"),  # , ".2f"),
@@ -876,7 +909,9 @@ class DistributedTrainer:
             assert self.current_base_dl is not None, "current_base_dl should be defined"
 
             # Log consumption statistics
-            if hasattr(self.current_base_dl, "dataset"):
+            if hasattr(self.current_base_dl, "dataset") and hasattr(
+                self.current_base_dl.dataset, "get_consumption_stats"
+            ):
                 for dataset_name, stats in self.current_base_dl.dataset.get_consumption_stats().items():
                     basic_log_entries.extend(
                         [
@@ -1009,11 +1044,11 @@ class DistributedTrainer:
     def _init_model_instance(self) -> NanotronModel:
         model_config_cls = self.model_config.__class__.__name__
         assert (
-            model_config_cls in CONFIG_TO_MODEL_CLASS
-        ), f"Unsupported model config {model_config_cls}. Only {CONFIG_TO_MODEL_CLASS.keys()} are supported"
+            model_config_cls in CONFIG_TO_TRAINING_MODEL_CLASS
+        ), f"Unsupported model config {model_config_cls}. Only {CONFIG_TO_TRAINING_MODEL_CLASS.keys()} are supported"
 
         model = self._init_model(
-            model_builder=lambda: CONFIG_TO_MODEL_CLASS[model_config_cls](
+            model_builder=lambda: CONFIG_TO_TRAINING_MODEL_CLASS[model_config_cls](
                 config=self.model_config,
                 parallel_context=self.parallel_context,
                 parallel_config=self.config.parallelism,
@@ -1049,7 +1084,8 @@ class DistributedTrainer:
                     parallel_context=self.parallel_context,
                     root_folder=self.config.model.init_method.path,
                 )
-            elif isinstance(self.config.model.init_method, (RandomInit, SpectralMupInit)):
+            elif isinstance(self.config.model.init_method, (RandomInit, SpectralMupInit, HyperCloningInit)):
+                # TODO (Kevin): Base model for HyperCloning could be initialized here instead and passed to init_model_randomly
                 unwrapped_model.init_model_randomly(config=self.config)
 
                 # Synchronize parameters so that the model is consistent
@@ -1175,7 +1211,9 @@ class DistributedTrainer:
 
     def pre_save_checkpoint(self) -> Path:
         # Check if eval_interval should be updated from file
-        eval_interval_file = self.config.lighteval.eval_interval_file
+        eval_interval_file = None
+        if self.config.lighteval:
+            eval_interval_file = self.config.lighteval.eval_interval_file
         if eval_interval_file is not None and Path(eval_interval_file).exists():
             try:
                 with open(eval_interval_file, "r") as f:
@@ -1218,10 +1256,28 @@ class DistributedTrainer:
                     rank=0,
                 )
 
-    def post_save_checkpoint(self):
+    def _push_to_hub(self, huggingface_config: HFUploadArgs):
+        # Join a previous upload process explicitly just in case
+        if self.hf_upload_process is not None:
+            self.hf_upload_process.join()
+
+        # Start checkpoint upload in a separate process to avoid blocking the training process
+        self.hf_upload_process = Process(
+            target=push_checkpoint_to_hub,
+            args=(huggingface_config, self.config.checkpoints.checkpoints_path, self.iteration_step, logger),
+        )
+        self.hf_upload_process.start()
+
+    def post_save_checkpoint(self, should_upload: bool):
+        if not should_upload:
+            return
+
         # Upload to S3
         if self.s3_mover is not None:
             self.s3_mover.start_uploading()
+        # Push to HuggingFace Hub
+        if self.config.hf_upload is not None:
+            self._push_to_hub(self.config.hf_upload)
 
         if dist.get_rank(self.parallel_context.world_pg) == 0:
             if self.config.lighteval is not None and self.s3_mover is None:
@@ -1251,18 +1307,16 @@ class DistributedTrainer:
         self.config.general.step = self.metadata.last_train_step
         self.config.general.consumed_train_samples = self.metadata.consumed_train_samples
 
+        should_save_model = bool(dist.get_rank(self.parallel_context.dp_pg) == 0)
+        should_save_config = bool(dist.get_rank(self.parallel_context.world_pg) == 0)
         save(
             model=self.unwrapped_model,
             optimizer=self.optimizer,
             lr_scheduler=self.lr_scheduler,
-            should_save_model=bool(
-                dist.get_rank(self.parallel_context.dp_pg) == 0
-            ),  # We only save the weights on DP==0
+            should_save_model=should_save_model,  # We only save the weights on DP==0
             should_save_optimizer=True,
             should_save_lr_scheduler=True,
-            should_save_config=bool(
-                dist.get_rank(self.parallel_context.world_pg) == 0
-            ),  # We only save the config on world_rank==0
+            should_save_config=should_save_config,  # We only save the config on world_rank==0
             parallel_context=self.parallel_context,
             root_folder=checkpoint_path,
             training_metadata=self.metadata,
@@ -1281,7 +1335,8 @@ class DistributedTrainer:
             with open(checkpoint_path / MODEL_CONFIG_FILE_NAME, mode="w") as fo:
                 fo.write(json.dumps(asdict(self.model_config)))
 
-        self.post_save_checkpoint()
+        # Only upload on DP==0 and world_rank==0
+        self.post_save_checkpoint(should_save_model and should_save_config)
 
         return checkpoint_path
 

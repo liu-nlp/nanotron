@@ -43,6 +43,11 @@ def get_args():
     group.add_argument(
         "--n-tasks", type=int, default=8, help="Total number of tasks to run the preprocessing step. Default: 8"
     )
+    group.add_argument(
+        "--progress",
+        action="store_true",
+        help="Whether to display a progress bar while reading the data. Default: False",
+    )
     # Subparsers for processing either Hugging Face datasets or jsonl files
     sp = parser.add_subparsers(
         dest="readers",
@@ -59,6 +64,9 @@ def get_args():
     )
     p1.add_argument("--column", type=str, default="text", help="Column to preprocess from the Dataset. Default: text")
     p1.add_argument("--split", type=str, default="train", help="Which split of the data to process. Default: train")
+    p1.add_argument(
+        "--subset", type=str, default=None, help="Optional configuration name of a specific subset to load"
+    )
 
     p2 = sp.add_parser(name="jsonl")
     p2.add_argument(
@@ -80,10 +88,14 @@ def get_args():
 def main(args):
     # Build datatrove reader
     if args.readers == "hf":
+        dataset_options = {"split": args.split}
+        if args.subset:
+            dataset_options["name"] = args.subset
         datatrove_reader = HuggingFaceDatasetReader(
             dataset=args.dataset,
             text_key=args.column,
-            dataset_options={"split": args.split},
+            dataset_options=dataset_options,
+            doc_progress=args.progress,
         )
     else:
         datatrove_reader = JsonlReader(data_folder=args.dataset, text_key=args.column, glob_pattern=args.glob_pattern)
@@ -95,8 +107,8 @@ def main(args):
                 output_folder=args.output_folder,
                 tokenizer_name_or_path=args.tokenizer_name_or_path,
                 eos_token=args.eos_token,
-                shuffle=False,
-                max_tokens_per_file=1e9,
+                shuffle_documents=False,
+                max_tokens_per_file=int(1e9),
             ),
         ],
         tasks=args.n_tasks,

@@ -192,8 +192,26 @@ def get_dataloader_from_data_stage(
         assert (
             len(tokenizer) == trainer.model_config.vocab_size
         ), f"Tokenizer vocab size ({len(tokenizer)}) does not match model config vocab size ({trainer.model_config.vocab_size}). "
+
+        if data.dataset.dataset_num_samples:
+            num_samples = sum(data.dataset.dataset_num_samples)
+            log_rank(
+                f"num_samples/global_batch_size: {int(num_samples/trainer.global_batch_size) + 1}",
+                logger=logger,
+                level=logging.INFO,
+                rank=0,
+            )
+            log_rank(
+                f"train_steps in config: {trainer.config.tokens.train_steps}",
+                logger=logger,
+                level=logging.INFO,
+                rank=0,
+            )
+        else:
+            num_samples = trainer.config.tokens.train_steps * trainer.global_batch_size
+
         log_rank(
-            f"[TokenizedBytes] Creating TokenizedBytes with {len(data.dataset.dataset_folder)} dataset folders and {trainer.config.tokens.train_steps * trainer.global_batch_size} train samples",
+            f"[TokenizedBytes] Creating TokenizedBytes with {len(data.dataset.dataset_folder)} dataset folders and {num_samples} train samples",
             logger=logger,
             level=logging.INFO,
             rank=0,
@@ -221,11 +239,11 @@ def get_dataloader_from_data_stage(
             num_workers=data.num_loading_workers,
             cfg=data.dataset,
             consumed_samples=consumed_train_samples,
-            num_samples=trainer.config.tokens.train_steps * trainer.global_batch_size,
+            num_samples=num_samples,
             parallel_context=trainer.parallel_context,
             input_pp_rank=input_pp_rank,
             output_pp_rank=output_pp_rank,
-            dataloader_drop_last=True,
+            dataloader_drop_last=data.dataset.drop_last,
             dataloader_pin_memory=True,
             use_position_ids=isinstance(trainer.model_config, Qwen2Config),
             use_doc_masking=getattr(trainer.model_config, "_use_doc_masking", None),
